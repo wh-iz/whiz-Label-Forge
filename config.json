@@ -1,0 +1,24 @@
+{
+    "video_path": "E:/Arc Raiders/full.mp4",
+    "youtube_link": "",
+    "yt_res": "2160p",
+    "models": [
+        "",
+        "C:/Users/whiz/Downloads/ARC_Raiders_25k.onnx"
+    ],
+    "output_path": "C:/Users/whiz/Desktop/ProLabeler-1.1/OUTPUT",
+    "conf_threshold": 0.4722426470588235,
+    "iou_threshold": 0.5031734317343174,
+    "frame_step": 5,
+    "merge_iou": 0.2985977859778598,
+    "use_gpu": true,
+    "similarity_threshold": 5,
+    "history_size": 30,
+    "input_size": 640,
+    "train_model": "yolov8n.pt",
+    "train_epochs": 1000,
+    "train_batch": 1,
+    "train_imgsz": 640,
+    "train_device": "auto",
+    "target_class_id": -1
+}
