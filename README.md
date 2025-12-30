@@ -70,6 +70,4 @@ This project is a heavily extended fork of [ProLabeler](https://github.com/Goodk
 
 This software is provided for research and educational purposes. Users are responsible for ensuring they have the right to use and annotate the media files processed by this tool.
 
-## License
 
-[License Information Placeholder]
