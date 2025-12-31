@@ -17,9 +17,15 @@ class LabelEditor(ttk.Frame):
         
         self.raw_image = None   # PIL Image
         self.tk_image = None    # ImageTk
-        self.scale_factor = 1.0
-        self.offset_x = 0
-        self.offset_y = 0
+        
+        # View transforms
+        self.fit_scale = 1.0    # Scale to fit window
+        self.zoom_level = 1.0   # User zoom
+        self.pan_x = 0          # User pan X
+        self.pan_y = 0          # User pan Y
+        
+        self.offset_x = 0       # Calculated center offset X
+        self.offset_y = 0       # Calculated center offset Y
         
         # Labels: list of [class_id, x_center, y_center, w, h] (normalized)
         self.labels = []
@@ -31,10 +37,17 @@ class LabelEditor(ttk.Frame):
         self.selected_box_index = -1
         
         # Interaction state
-        self.interaction_mode = 'idle' # idle, draw, move, resize
+        self.interaction_mode = 'idle' # idle, draw, move, resize, pan
         self.active_handle = None
         self.drag_start_pos = None
         self.initial_box_state = None
+        self.pan_start_pos = None
+        
+        # History
+        self.history = []
+        self.history_index = -1
+        
+        self.thumbnail_cache = {}
         
         self.setup_ui()
         
@@ -51,9 +64,27 @@ class LabelEditor(ttk.Frame):
         
         ttk.Label(self.sidebar, text="Images").pack(pady=5)
         
-        self.file_listbox = tk.Listbox(self.sidebar, selectmode="single", bg="#1e1e1e", fg="#ffffff", highlightthickness=0, borderwidth=0)
-        self.file_listbox.pack(fill="both", expand=True, padx=5, pady=5)
-        self.file_listbox.bind("<<ListboxSelect>>", self.on_file_select)
+        # Treeview with Scrollbar
+        self.sidebar_frame = ttk.Frame(self.sidebar)
+        self.sidebar_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        self.file_tree = ttk.Treeview(self.sidebar_frame, selectmode="extended", show="tree", columns=("filename"))
+        self.file_tree.column("#0", width=60, minwidth=60, stretch=False) # Thumbnail column
+        self.file_tree.column("filename", anchor="w")
+        self.file_tree.heading("#0", text="Prev")
+        self.file_tree.heading("filename", text="Filename")
+        
+        self.scrollbar = ttk.Scrollbar(self.sidebar_frame, orient="vertical", command=self.file_tree.yview)
+        self.file_tree.configure(yscrollcommand=self.scrollbar.set)
+        
+        self.file_tree.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        
+        self.file_tree.bind("<<TreeviewSelect>>", self.on_file_select)
+        
+        # Configure row height for thumbnails
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=60)
         
         # --- Right Area ---
         self.right_frame = ttk.Frame(self.paned)
@@ -70,7 +101,7 @@ class LabelEditor(ttk.Frame):
         
         ttk.Button(self.toolbar, text="Save (Ctrl+S)", command=self.save_labels).pack(side="left", padx=10)
         ttk.Button(self.toolbar, text="Delete Box (Del)", command=self.delete_selected).pack(side="left", padx=5)
-        ttk.Button(self.toolbar, text="Delete Image", command=self.delete_current_image).pack(side="left", padx=5)
+        ttk.Button(self.toolbar, text="Delete Image", command=self.delete_selected_images).pack(side="left", padx=5)
         ttk.Button(self.toolbar, text="Refresh", command=self.refresh_file_list).pack(side="left", padx=5)
         
         self.lbl_status = ttk.Label(self.toolbar, text="No image loaded")
@@ -88,15 +119,40 @@ class LabelEditor(ttk.Frame):
         self.canvas.bind("<ButtonPress-1>", self.on_mouse_down)
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
-        # Right click to select/delete? Let's use left click to select, Del key to delete
-        self.canvas.bind("<ButtonPress-3>", self.on_right_click) # Right click delete
         
-        # Key bindings (global to app usually, but we bind to canvas focus)
+        # Pan & Zoom
+        self.canvas.bind("<ButtonPress-2>", self.on_pan_start) # Middle click
+        self.canvas.bind("<B2-Motion>", self.on_pan_drag)
+        self.canvas.bind("<MouseWheel>", self.on_zoom) # Windows
+        self.canvas.bind("<Button-4>", self.on_zoom)   # Linux up
+        self.canvas.bind("<Button-5>", self.on_zoom)   # Linux down
+        
+        # Right click to select/delete
+        self.canvas.bind("<ButtonPress-3>", self.on_right_click)
+        
+        # Key bindings
         self.canvas.bind("<Delete>", lambda e: self.delete_selected())
         self.canvas.bind("<Control-s>", lambda e: self.save_labels())
+        self.canvas.bind("<Control-z>", lambda e: self.undo())
+        self.canvas.bind("<Control-y>", lambda e: self.redo())
+        self.canvas.bind("<Left>", lambda e: self.prev_image())
+        self.canvas.bind("<Right>", lambda e: self.next_image())
         
         # Focus canvas on enter
         self.canvas.bind("<Enter>", lambda e: self.canvas.focus_set())
+
+    def get_thumbnail(self, path):
+        if path in self.thumbnail_cache:
+            return self.thumbnail_cache[path]
+            
+        try:
+            img = Image.open(path)
+            img.thumbnail((50, 50))
+            photo = ImageTk.PhotoImage(img)
+            self.thumbnail_cache[path] = photo
+            return photo
+        except Exception:
+            return None
 
     def refresh_file_list(self):
         if not self.app: return
@@ -113,18 +169,33 @@ class LabelEditor(ttk.Frame):
             
         self.image_list = sorted([f for f in os.listdir(img_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
         
-        self.file_listbox.delete(0, "end")
-        for f in self.image_list:
-            self.file_listbox.insert("end", f)
+        # Clear Treeview
+        for item in self.file_tree.get_children():
+            self.file_tree.delete(item)
+            
+        # Populate Treeview
+        for i, f in enumerate(self.image_list):
+            full_path = os.path.join(img_dir, f)
+            thumb = self.get_thumbnail(full_path)
+            # Use i as iid to easily map back to index
+            if thumb:
+                self.file_tree.insert("", "end", iid=str(i), text="", image=thumb, values=(f,))
+            else:
+                self.file_tree.insert("", "end", iid=str(i), text="", values=(f,))
             
         self.lbl_status.config(text=f"Found {len(self.image_list)} images")
 
     def on_file_select(self, event):
-        sel = self.file_listbox.curselection()
+        sel = self.file_tree.selection()
         if not sel: return
         
-        idx = sel[0]
-        self.load_image_by_index(idx)
+        # In extended mode, user can select multiple. 
+        # For preview, we just load the first one selected.
+        try:
+            idx = int(sel[0])
+            self.load_image_by_index(idx)
+        except ValueError:
+            pass
 
     def load_image_by_index(self, index):
         if index < 0 or index >= len(self.image_list): return
@@ -138,6 +209,11 @@ class LabelEditor(ttk.Frame):
         # Load Labels
         label_name = os.path.splitext(filename)[0] + ".txt"
         self.current_label_path = os.path.join(output_path, "labels", label_name)
+        
+        # Reset View
+        self.zoom_level = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
         
         self.load_labels()
         self.load_image_file()
@@ -156,6 +232,43 @@ class LabelEditor(ttk.Frame):
                         w = float(parts[3])
                         h = float(parts[4])
                         self.labels.append([cls, cx, cy, w, h])
+        self.reset_history()
+
+    def reset_history(self):
+        self.history = []
+        self.history_index = -1
+        self.save_state()
+
+    def save_state(self):
+        # Deep copy labels
+        current_state = [list(lbl) for lbl in self.labels]
+        
+        # If we are not at the end, cut the future
+        if self.history_index < len(self.history) - 1:
+            self.history = self.history[:self.history_index+1]
+            
+        self.history.append(current_state)
+        self.history_index += 1
+        
+        # Limit history
+        if len(self.history) > 50:
+            self.history.pop(0)
+            self.history_index -= 1
+
+    def undo(self):
+        if self.history_index > 0:
+            self.history_index -= 1
+            self.labels = [list(lbl) for lbl in self.history[self.history_index]]
+            self.draw_boxes()
+            self.lbl_status.config(text="Undo")
+
+    def redo(self):
+        if self.history_index < len(self.history) - 1:
+            self.history_index += 1
+            self.labels = [list(lbl) for lbl in self.history[self.history_index]]
+            self.draw_boxes()
+            self.lbl_status.config(text="Redo")
+
 
     def save_labels(self):
         if not self.current_label_path: return
@@ -181,51 +294,74 @@ class LabelEditor(ttk.Frame):
         if self.raw_image:
             self.redraw()
 
+    @property
+    def total_scale(self):
+        return self.fit_scale * self.zoom_level
+
+    def image_to_screen(self, ix, iy):
+        sx = ix * self.total_scale + self.offset_x + self.pan_x
+        sy = iy * self.total_scale + self.offset_y + self.pan_y
+        return sx, sy
+
+    def screen_to_image(self, sx, sy):
+        if self.total_scale == 0: return 0, 0
+        ix = (sx - self.offset_x - self.pan_x) / self.total_scale
+        iy = (sy - self.offset_y - self.pan_y) / self.total_scale
+        return ix, iy
+
     def redraw(self):
         if not self.raw_image: return
         
-        # Calculate scale to fit canvas
         cw = self.canvas.winfo_width()
         ch = self.canvas.winfo_height()
         iw, ih = self.raw_image.size
         
-        if cw <= 1 or ch <= 1: return # Not ready
+        if cw <= 1 or ch <= 1: return
         
-        # Scale to fit
+        # Calculate fit scale
         scale_w = cw / iw
         scale_h = ch / ih
-        self.scale_factor = min(scale_w, scale_h, 1.0) # Don't upscale if smaller? Actually better to just fit
-        self.scale_factor = min(scale_w, scale_h) * 0.95 # Leave some margin
+        self.fit_scale = min(scale_w, scale_h) * 0.95
         
-        nw = int(iw * self.scale_factor)
-        nh = int(ih * self.scale_factor)
+        # Current drawing dimensions
+        current_scale = self.total_scale
+        nw = int(iw * current_scale)
+        nh = int(ih * current_scale)
         
+        # Center offset (base)
         self.offset_x = (cw - nw) // 2
         self.offset_y = (ch - nh) // 2
         
-        resized = self.raw_image.resize((nw, nh), Image.Resampling.LANCZOS)
-        self.tk_image = ImageTk.PhotoImage(resized)
+        # Final draw position
+        final_x = self.offset_x + self.pan_x
+        final_y = self.offset_y + self.pan_y
         
-        self.canvas.delete("all")
-        self.canvas.create_image(self.offset_x, self.offset_y, anchor="nw", image=self.tk_image)
-        
-        # Draw labels
-        self.draw_boxes()
+        try:
+            # Resize image for display
+            resized = self.raw_image.resize((max(1, nw), max(1, nh)), Image.Resampling.NEAREST)
+            self.tk_image = ImageTk.PhotoImage(resized)
+            
+            self.canvas.delete("all")
+            self.canvas.create_image(final_x, final_y, anchor="nw", image=self.tk_image)
+            
+            self.draw_boxes()
+        except Exception as e:
+            print(f"Redraw error: {e}")
 
     def get_box_pixel_coords(self, index):
         if index < 0 or index >= len(self.labels): return None
         cls, cx, cy, w, h = self.labels[index]
         iw, ih = self.raw_image.size
         
+        # Normalized to Image Pixels
         img_x1 = (cx - w/2) * iw
         img_y1 = (cy - h/2) * ih
         img_x2 = (cx + w/2) * iw
         img_y2 = (cy + h/2) * ih
         
-        x1 = img_x1 * self.scale_factor + self.offset_x
-        y1 = img_y1 * self.scale_factor + self.offset_y
-        x2 = img_x2 * self.scale_factor + self.offset_x
-        y2 = img_y2 * self.scale_factor + self.offset_y
+        # Image Pixels to Screen Pixels
+        x1, y1 = self.image_to_screen(img_x1, img_y1)
+        x2, y2 = self.image_to_screen(img_x2, img_y2)
         
         return x1, y1, x2, y2
 
@@ -245,7 +381,6 @@ class LabelEditor(ttk.Frame):
             self.canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=width, tags=("box", f"box_{i}"))
             self.canvas.create_text(x1, y1-10, text=f"{cls}", fill=color, anchor="sw", tags=("box", f"txt_{i}"))
             
-            # Draw handles if selected
             if i == self.selected_box_index:
                 self.draw_handles(x1, y1, x2, y2)
 
@@ -255,7 +390,7 @@ class LabelEditor(ttk.Frame):
             self.canvas.create_rectangle(hx1, hy1, hx2, hy2, fill="cyan", outline="black", tags=("handle", f"handle_{name}"))
 
     def get_handle_coords(self, x1, y1, x2, y2):
-        s = 8 # handle size
+        s = 8 
         hw = s/2
         xm = (x1 + x2) / 2
         ym = (y1 + y2) / 2
@@ -287,32 +422,62 @@ class LabelEditor(ttk.Frame):
     def get_canvas_coords(self, event):
         return event.x, event.y
 
+    def on_zoom(self, event):
+        if not self.raw_image: return
+        
+        factor = 1.1
+        if event.num == 5 or event.delta < 0:
+            self.zoom_level /= factor
+        else:
+            self.zoom_level *= factor
+            
+        self.zoom_level = max(0.1, min(self.zoom_level, 50.0))
+        self.redraw()
+
+    def on_pan_start(self, event):
+        if not self.raw_image: return
+        self.interaction_mode = 'pan'
+        self.pan_start_pos = (event.x, event.y)
+        self.canvas.config(cursor="fleur")
+
+    def on_pan_drag(self, event):
+        if self.interaction_mode != 'pan': return
+        dx = event.x - self.pan_start_pos[0]
+        dy = event.y - self.pan_start_pos[1]
+        
+        self.pan_x += dx
+        self.pan_y += dy
+        
+        self.pan_start_pos = (event.x, event.y)
+        self.redraw()
+
     def on_mouse_down(self, event):
         if not self.raw_image: return
+        
         x, y = self.get_canvas_coords(event)
         
-        # 1. Check handles of selected box
+        # 1. Check handles
         handle = self.get_handle_at(x, y)
         if handle:
+            self.save_state() # Save before resize
             self.interaction_mode = 'resize'
             self.active_handle = handle
             self.drag_start_pos = (x, y)
             self.initial_box_state = list(self.labels[self.selected_box_index])
             return
 
-        # 2. Check if inside a box
+        # 2. Check boxes
         clicked_box = -1
-        # Iterate reverse
         for i in range(len(self.labels)-1, -1, -1):
             coords = self.get_box_pixel_coords(i)
             if not coords: continue
             x1, y1, x2, y2 = coords
-            
             if x1 <= x <= x2 and y1 <= y <= y2:
                 clicked_box = i
                 break
         
         if clicked_box != -1:
+            self.save_state() # Save before move
             self.selected_box_index = clicked_box
             self.class_var.set(str(self.labels[clicked_box][0]))
             self.draw_boxes()
@@ -322,7 +487,7 @@ class LabelEditor(ttk.Frame):
             self.initial_box_state = list(self.labels[clicked_box])
             return
         
-        # 3. Background -> Start Drawing
+        # 3. Start Draw
         self.selected_box_index = -1
         self.draw_boxes()
         self.interaction_mode = 'draw'
@@ -342,10 +507,9 @@ class LabelEditor(ttk.Frame):
             dx = x - self.drag_start_pos[0]
             dy = y - self.drag_start_pos[1]
             
-            # Convert px delta to normalized delta
             iw, ih = self.raw_image.size
-            norm_dx = dx / self.scale_factor / iw
-            norm_dy = dy / self.scale_factor / ih
+            norm_dx = dx / self.total_scale / iw
+            norm_dy = dy / self.total_scale / ih
             
             cls, cx, cy, w, h = self.initial_box_state
             self.labels[self.selected_box_index] = [cls, cx + norm_dx, cy + norm_dy, w, h]
@@ -357,25 +521,21 @@ class LabelEditor(ttk.Frame):
             iw, ih = self.raw_image.size
             cls, cx, cy, w, h = self.initial_box_state
             
-            # Initial pixel coords (relative to image)
+            # Initial image pixels
             img_x1 = (cx - w/2) * iw
             img_y1 = (cy - h/2) * ih
             img_x2 = (cx + w/2) * iw
             img_y2 = (cy + h/2) * ih
             
-            # Delta in image pixels
-            dx = (x - self.drag_start_pos[0]) / self.scale_factor
-            dy = (y - self.drag_start_pos[1]) / self.scale_factor
+            # Screen Delta -> Image Delta
+            dx_img = (x - self.drag_start_pos[0]) / self.total_scale
+            dy_img = (y - self.drag_start_pos[1]) / self.total_scale
             
-            # Update edges based on handle
-            if 'w' in self.active_handle: img_x1 += dx
-            if 'e' in self.active_handle: img_x2 += dx
-            if 'n' in self.active_handle: img_y1 += dy
-            if 's' in self.active_handle: img_y2 += dy
+            if 'w' in self.active_handle: img_x1 += dx_img
+            if 'e' in self.active_handle: img_x2 += dx_img
+            if 'n' in self.active_handle: img_y1 += dy_img
+            if 's' in self.active_handle: img_y2 += dy_img
             
-            # Recalculate normalized
-            # Don't clamp here, allow free resize until mouse up or just clamp visually
-            # Actually better to handle min size here to avoid crash
             if img_x2 < img_x1: img_x2 = img_x1 + 1
             if img_y2 < img_y1: img_y2 = img_y1 + 1
             
@@ -392,29 +552,25 @@ class LabelEditor(ttk.Frame):
             if self.start_x is not None:
                 end_x, end_y = self.get_canvas_coords(event)
                 
-                x1 = min(self.start_x, end_x) - self.offset_x
-                y1 = min(self.start_y, end_y) - self.offset_y
-                x2 = max(self.start_x, end_x) - self.offset_x
-                y2 = max(self.start_y, end_y) - self.offset_y
+                # Convert screen rect to image rect
+                ix1, iy1 = self.screen_to_image(min(self.start_x, end_x), min(self.start_y, end_y))
+                ix2, iy2 = self.screen_to_image(max(self.start_x, end_x), max(self.start_y, end_y))
                 
                 self.canvas.delete(self.current_rect)
                 
-                if (x2 - x1) >= 5 and (y2 - y1) >= 5:
-                    iw, ih = self.raw_image.size
-                    x1 = max(0, min(x1, iw * self.scale_factor))
-                    y1 = max(0, min(y1, ih * self.scale_factor))
-                    x2 = max(0, min(x2, iw * self.scale_factor))
-                    y2 = max(0, min(y2, ih * self.scale_factor))
-                    
-                    raw_x1 = x1 / self.scale_factor
-                    raw_y1 = y1 / self.scale_factor
-                    raw_x2 = x2 / self.scale_factor
-                    raw_y2 = y2 / self.scale_factor
-                    
-                    w = raw_x2 - raw_x1
-                    h = raw_y2 - raw_y1
-                    cx = raw_x1 + w/2
-                    cy = raw_y1 + h/2
+                iw, ih = self.raw_image.size
+                
+                # Clamp to image
+                ix1 = max(0, min(ix1, iw))
+                iy1 = max(0, min(iy1, ih))
+                ix2 = max(0, min(ix2, iw))
+                iy2 = max(0, min(iy2, ih))
+                
+                if (ix2 - ix1) > 2 and (iy2 - iy1) > 2:
+                    w = ix2 - ix1
+                    h = iy2 - iy1
+                    cx = ix1 + w/2
+                    cy = iy1 + h/2
                     
                     cls_id = self.class_var.get() or "0"
                     self.labels.append([cls_id, cx/iw, cy/ih, w/iw, h/ih])
@@ -422,10 +578,27 @@ class LabelEditor(ttk.Frame):
             
             self.start_x = None
             self.draw_boxes()
+        
+        if self.interaction_mode == 'pan':
+            self.canvas.config(cursor="")
             
         self.interaction_mode = 'idle'
         self.active_handle = None
         self.drag_start_pos = None
+
+    def prev_image(self):
+        if self.current_index > 0:
+            next_idx = self.current_index - 1
+            self.file_tree.selection_set(str(next_idx))
+            self.file_tree.see(str(next_idx))
+            self.load_image_by_index(next_idx)
+
+    def next_image(self):
+        if self.current_index < len(self.image_list) - 1:
+            next_idx = self.current_index + 1
+            self.file_tree.selection_set(str(next_idx))
+            self.file_tree.see(str(next_idx))
+            self.load_image_by_index(next_idx)
 
     def delete_selected(self):
         if self.selected_box_index != -1:
@@ -433,47 +606,55 @@ class LabelEditor(ttk.Frame):
             self.selected_box_index = -1
             self.draw_boxes()
 
-    def delete_current_image(self):
-        if not self.current_image_path or not os.path.exists(self.current_image_path):
+    def delete_selected_images(self):
+        sel = self.file_tree.selection()
+        if not sel: return
+
+        if not messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete {len(sel)} images?"):
             return
 
-        if not messagebox.askyesno("Confirm Delete", "Are you sure you want to delete this image and its labels?"):
-            return
+        output_path = self.app.output_path.get()
+        deleted_count = 0
+        
+        # Get filenames first because indices change if we pop from list
+        # But we will rebuild list anyway
+        files_to_delete = []
+        for iid in sel:
+            try:
+                idx = int(iid)
+                if 0 <= idx < len(self.image_list):
+                    files_to_delete.append(self.image_list[idx])
+            except ValueError:
+                pass
 
-        try:
-            # Delete Image
-            os.remove(self.current_image_path)
-            
-            # Delete Label if exists
-            if self.current_label_path and os.path.exists(self.current_label_path):
-                os.remove(self.current_label_path)
-            
-            # Update List
-            del self.image_list[self.current_index]
-            self.file_listbox.delete(self.current_index)
-            
-            # Load next or previous
-            if self.current_index >= len(self.image_list):
-                self.current_index = len(self.image_list) - 1
-            
-            if self.current_index >= 0:
-                self.file_listbox.selection_clear(0, "end")
-                self.file_listbox.selection_set(self.current_index)
-                self.load_image_by_index(self.current_index)
-            else:
-                # No images left
-                self.current_image_path = None
-                self.current_label_path = None
-                self.labels = []
-                self.raw_image = None
-                self.canvas.delete("all")
-                self.lbl_status.config(text="No images")
+        for fname in files_to_delete:
+            try:
+                img_path = os.path.join(output_path, "images", fname)
+                lbl_path = os.path.join(output_path, "labels", os.path.splitext(fname)[0] + ".txt")
+                
+                if os.path.exists(img_path): os.remove(img_path)
+                if os.path.exists(lbl_path): os.remove(lbl_path)
+                
+                # Remove from cache
+                if img_path in self.thumbnail_cache:
+                    del self.thumbnail_cache[img_path]
+                    
+                deleted_count += 1
+            except Exception as e:
+                print(f"Error deleting {fname}: {e}")
 
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to delete: {e}")
+        # Refresh entire list
+        self.refresh_file_list()
+        
+        # Reset view
+        self.current_image_path = None
+        self.current_label_path = None
+        self.labels = []
+        self.raw_image = None
+        self.canvas.delete("all")
+        self.lbl_status.config(text=f"Deleted {deleted_count} images")
 
     def on_right_click(self, event):
-        # Quick delete
-        self.on_mouse_down(event) # Select
+        self.on_mouse_down(event)
         if self.selected_box_index != -1:
             self.delete_selected()

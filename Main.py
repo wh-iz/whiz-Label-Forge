@@ -575,7 +575,7 @@ def main(args=None, progress_callback=None, detect_progress_callback=None, cance
                     if save_callback:
                         save_callback(img_path, label_path, ann_path)
                     saved_count += 1
-                    if getattr(args, 'save_raw', True):
+                    if getattr(args, 'save_raw', True) and final_boxes:
                         cv2.imwrite(img_path, frame)
                     else:
                         try:
