@@ -12,6 +12,7 @@ import tempfile
 import time
 import shutil
 import random
+import keyboard
 from LabelEditor import LabelEditor
 from NullGeneratorTab import NullGeneratorTab
 
@@ -120,6 +121,7 @@ class App(tk.Tk):
         self.setup_footer()
         
         self.load_config()
+        self.setup_autosave()
 
     def setup_editor_tab(self):
         self.label_editor = LabelEditor(self.tab_editor, app_instance=self)
@@ -132,6 +134,9 @@ class App(tk.Tk):
         tab_text = event.widget.tab(selected_tab, "text")
         if tab_text == "Label Editor":
             self.label_editor.refresh_file_list()
+        
+        # Autosave on tab switch
+        self.save_config(silent=True)
 
     def setup_dashboard_tab(self):
         self.tab_dashboard.columnconfigure(0, weight=4) # Input/Config column
@@ -394,6 +399,9 @@ class App(tk.Tk):
             if not hasattr(self, 'model_paths'):
                 self.model_paths = {}
             self.model_paths[filename] = f
+        
+        if files:
+            self.save_config(silent=True)
 
     def remove_model(self):
         selected = self.models_listbox.curselection()
@@ -405,6 +413,8 @@ class App(tk.Tk):
             self.models_listbox.delete(index)
             if filename in self.model_paths:
                 del self.model_paths[filename]
+        
+        self.save_config(silent=True)
 
     def update_status(self, text, color):
         self.status_label.config(text=text, foreground=color)
@@ -607,14 +617,21 @@ class App(tk.Tk):
         self.stats_label.config(text=stats_text)
 
     # ---------- Config Management ----------
-    def save_config(self):
+    def save_config(self, silent=False):
         model_filenames = list(self.models_listbox.get(0, "end"))
         full_model_paths = [self.model_paths.get(fn, fn) for fn in model_filenames]
         
+        # Get active tab index
+        current_tab_index = 0
+        try:
+            current_tab_index = self.notebook.index(self.notebook.select())
+        except: pass
+
         config = {
             "video_path": self.video_path.get(),
             "youtube_link": self.youtube_link.get(),
             "yt_res": self.yt_res.get(),
+            "out_res": self.out_res.get(),
             "models": full_model_paths,
             "output_path": self.output_path.get(),
             "conf_threshold": self.conf_threshold.get(),
@@ -634,43 +651,85 @@ class App(tk.Tk):
             "train_batch": self.train_batch.get(),
             "train_imgsz": self.train_imgsz.get(),
             "train_device": self.train_device.get(),
+            "active_tab": current_tab_index
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(config, f, indent=4)
-        messagebox.showinfo("Saved", "Configuration saved successfully!")
+        
+        if not silent:
+            messagebox.showinfo("Saved", "Configuration saved successfully!")
 
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                config = json.load(f)
-            self.video_path.set(config.get("video_path", ""))
-            self.youtube_link.set(config.get("youtube_link", ""))
-            self.yt_res.set(config.get("yt_res", "1080p"))
-            self.out_res.set(config.get("out_res", "off"))
-            self.models_listbox.delete(0, "end")
-            self.model_paths = {}
-            for full_path in config.get("models", []):
-                filename = os.path.basename(full_path)
-                self.models_listbox.insert("end", filename)
-                self.model_paths[filename] = full_path
-            self.output_path.set(config.get("output_path", ""))
-            self.conf_threshold.set(config.get("conf_threshold", 0.5))
-            self.iou_threshold.set(config.get("iou_threshold", 0.45))
-            self.frame_step.set(config.get("frame_step", 1))
-            self.merge_iou.set(config.get("merge_iou", 0.6))
-            self.use_gpu.set(config.get("use_gpu", True))
-            self.similarity_threshold.set(config.get("similarity_threshold", 5))
-            self.history_size.set(config.get("history_size", 30))
-            self.input_size.set(config.get("input_size", 640))
-            self.target_class_id.set(config.get("target_class_id", -1))
-            self.save_raw.set(config.get("save_raw", True))
-            self.save_empty.set(config.get("save_empty", False))
-            self.save_annotated.set(config.get("save_annotated", True))
-            self.train_model.set(config.get("train_model", "yolov8n.pt"))
-            self.train_epochs.set(config.get("train_epochs", 50))
-            self.train_batch.set(config.get("train_batch", 16))
-            self.train_imgsz.set(config.get("train_imgsz", 640))
-            self.train_device.set(config.get("train_device", "auto"))
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    config = json.load(f)
+                self.video_path.set(config.get("video_path", ""))
+                self.youtube_link.set(config.get("youtube_link", ""))
+                self.yt_res.set(config.get("yt_res", "1080p"))
+                self.out_res.set(config.get("out_res", "off"))
+                self.models_listbox.delete(0, "end")
+                self.model_paths = {}
+                for full_path in config.get("models", []):
+                    filename = os.path.basename(full_path)
+                    self.models_listbox.insert("end", filename)
+                    self.model_paths[filename] = full_path
+                self.output_path.set(config.get("output_path", ""))
+                self.conf_threshold.set(config.get("conf_threshold", 0.5))
+                self.iou_threshold.set(config.get("iou_threshold", 0.45))
+                self.frame_step.set(config.get("frame_step", 1))
+                self.merge_iou.set(config.get("merge_iou", 0.6))
+                self.use_gpu.set(config.get("use_gpu", True))
+                self.similarity_threshold.set(config.get("similarity_threshold", 5))
+                self.history_size.set(config.get("history_size", 30))
+                self.input_size.set(config.get("input_size", 640))
+                self.target_class_id.set(config.get("target_class_id", -1))
+                self.save_raw.set(config.get("save_raw", True))
+                self.save_empty.set(config.get("save_empty", False))
+                self.save_annotated.set(config.get("save_annotated", True))
+                
+                # TPS
+                self.tps_enabled.set(config.get("tps_enabled", False))
+                self.tps_side = config.get("tps_side", "left")
+                self.tps_hotkey = config.get("tps_hotkey", "t")
+                if hasattr(self, 'tps_status_label'):
+                    self.tps_status_label.config(text=f"Side: {self.tps_side.upper()} (Hotkey: {self.tps_hotkey.upper()})")
+
+                self.train_model.set(config.get("train_model", "yolov8n.pt"))
+                self.train_epochs.set(config.get("train_epochs", 50))
+                self.train_batch.set(config.get("train_batch", 16))
+                self.train_imgsz.set(config.get("train_imgsz", 640))
+                self.train_device.set(config.get("train_device", "auto"))
+
+                # Restore Tab
+                tab_idx = config.get("active_tab", 0)
+                if tab_idx < len(self.notebook.tabs()):
+                    self.notebook.select(tab_idx)
+            except Exception as e:
+                print(f"Error loading config: {e}")
+
+    def setup_autosave(self):
+        """Bind variables to autosave logic."""
+        vars_to_trace = [
+            self.video_path, self.youtube_link, self.output_path,
+            self.conf_threshold, self.iou_threshold, self.frame_step,
+            self.merge_iou, self.use_gpu, self.similarity_threshold,
+            self.history_size, self.input_size, self.target_class_id,
+            self.save_raw, self.save_empty, self.save_annotated,
+            self.train_epochs, self.train_batch, self.train_imgsz,
+            self.train_device, self.train_model
+        ]
+        
+        for v in vars_to_trace:
+            v.trace_add("write", lambda *args: self.save_config(silent=True))
+
+        # Comboboxes
+        self.yt_res.bind("<<ComboboxSelected>>", lambda e: self.save_config(silent=True))
+        self.out_res.bind("<<ComboboxSelected>>", lambda e: self.save_config(silent=True))
+        # self.train_device is a Var, but let's bind the combo too if it has a ref, 
+        # actually train_device var trace covers it.
+        
+        # Note: Listbox and Tab changes are handled in their respective methods/bindings.
 
     class TextRedirector:
         """Redirects print() output to a Tkinter Text widget in real time."""
@@ -777,10 +836,12 @@ class App(tk.Tk):
 
         try:
             import sys
-            import Main
-
+            
+            # Redirect stdout/stderr to GUI log immediately so import errors are caught
             old_stdout, old_stderr = sys.stdout, sys.stderr
             sys.stdout = sys.stderr = self.TextRedirector(self.log_text)
+            
+            import Main
 
             self.update_status("🟡 Running...", "#FFD966")
 
@@ -797,7 +858,18 @@ class App(tk.Tk):
             self.update_status("🟢 Done", "#9FEF9F")
 
         except Exception as e:
-            print(f"\n[ERROR] {e}")
+            import traceback
+            trace = traceback.format_exc()
+            full_error = f"{e}\n{trace}"
+            print(f"\n[ERROR] {full_error}")
+            
+            # Write error to file for debugging
+            try:
+                with open("error_log.txt", "w") as f:
+                    f.write(full_error)
+            except:
+                pass
+
             self.update_status("🔴 Error", "#FF7F7F")
 
         finally:
@@ -866,6 +938,13 @@ class App(tk.Tk):
         threading.Thread(target=self.training_worker, args=(yaml_path, weights, epochs, imgsz, batch, device), daemon=True).start()
 
     def training_worker(self, yaml_path, weights, epochs, imgsz, batch, device):
+        # Redirect stdout/stderr if they are None (common in frozen apps)
+        import sys
+        if sys.stdout is None:
+            sys.stdout = self.TextRedirector(self.log_text)
+        if sys.stderr is None:
+            sys.stderr = self.TextRedirector(self.log_text)
+
         self.update_status("🟡 Training...", "#FFD966")
         try:
             from ultralytics import YOLO

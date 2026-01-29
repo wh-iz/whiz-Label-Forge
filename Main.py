@@ -336,9 +336,11 @@ def main(args=None, progress_callback=None, detect_progress_callback=None, cance
 
     def should_cancel():
         try:
-            return bool(cancel_check and cancel_check())
+            if cancel_check and cancel_check():
+                return True
         except Exception:
-            return False
+            pass
+        return False
 
     try:
         video_path = None  # Initialize early to prevent UnboundLocalError in finally block
@@ -498,7 +500,7 @@ def main(args=None, progress_callback=None, detect_progress_callback=None, cance
                 if frame is None or not hasattr(frame, "shape"):
                     frame_idx += 1
                     continue
-
+                
                 img_h, img_w = frame.shape[:2]
                 ensemble_boxes = []
 

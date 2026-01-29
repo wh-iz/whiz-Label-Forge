@@ -98,6 +98,8 @@ class LabelEditor(ttk.Frame):
         self.class_var = tk.StringVar(value="0")
         self.class_entry = ttk.Entry(self.toolbar, textvariable=self.class_var, width=10)
         self.class_entry.pack(side="left", padx=5)
+        self.class_entry.bind("<Return>", self.update_selected_class)
+        self.class_entry.bind("<FocusOut>", self.update_selected_class)
         
         ttk.Button(self.toolbar, text="Save (Ctrl+S)", command=self.save_labels).pack(side="left", padx=10)
         ttk.Button(self.toolbar, text="Delete Box (Del)", command=self.delete_selected).pack(side="left", padx=5)
@@ -197,9 +199,20 @@ class LabelEditor(ttk.Frame):
         except ValueError:
             pass
 
+    def update_selected_class(self, event=None):
+        if self.selected_box_index != -1 and 0 <= self.selected_box_index < len(self.labels):
+            new_cls = self.class_var.get()
+            # Update the class of the selected box
+            self.labels[self.selected_box_index][0] = new_cls
+            self.draw_boxes()
+
     def load_image_by_index(self, index):
         if index < 0 or index >= len(self.image_list): return
         
+        # Auto-save previous image
+        if self.current_image_path and self.current_label_path:
+             self.save_labels(silent=True)
+
         self.current_index = index
         filename = self.image_list[index]
         output_path = self.app.output_path.get()
@@ -270,7 +283,7 @@ class LabelEditor(ttk.Frame):
             self.lbl_status.config(text="Redo")
 
 
-    def save_labels(self):
+    def save_labels(self, silent=False):
         if not self.current_label_path: return
         
         # Ensure labels dir exists
@@ -280,8 +293,9 @@ class LabelEditor(ttk.Frame):
             for lbl in self.labels:
                 f.write(f"{lbl[0]} {lbl[1]:.6f} {lbl[2]:.6f} {lbl[3]:.6f} {lbl[4]:.6f}\n")
         
-        self.lbl_status.config(text="Saved!")
-        self.after(2000, lambda: self.lbl_status.config(text=""))
+        if not silent:
+            self.lbl_status.config(text="Saved!")
+            self.after(2000, lambda: self.lbl_status.config(text=""))
 
     def load_image_file(self):
         try:
