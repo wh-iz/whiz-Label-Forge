@@ -53,7 +53,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("whiz label forge")
+        self.title("whiz label forge v1.2")
         self.geometry("1100x780")
         self.minsize(950, 700)
 
