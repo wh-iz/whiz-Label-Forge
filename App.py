@@ -12,7 +12,6 @@ import tempfile
 import time
 import shutil
 import random
-import keyboard
 from LabelEditor import LabelEditor
 from NullGeneratorTab import NullGeneratorTab
 
@@ -329,11 +328,18 @@ class App(tk.Tk):
         self.tab_tools.columnconfigure(0, weight=1)
 
         # Dataset Tools
-        ds_group = ttk.LabelFrame(self.tab_tools, text="Dataset Tools", padding=20)
+        ds_group = ttk.LabelFrame(self.tab_tools, text="Dataset Splitting & Preparation", padding=20)
         ds_group.pack(fill="x", pady=20, padx=20)
         
-        ttk.Button(ds_group, text="Split Train/Val (70/30)", command=self.split_dataset_logic).pack(fill="x", pady=(0, 5))
-        ttk.Label(ds_group, text="Automatically splits images/labels into train/val folders and generates data.yaml", foreground="gray").pack()
+        split_ctrl = ttk.Frame(ds_group)
+        split_ctrl.pack(fill="x", pady=(0, 10))
+        ttk.Label(split_ctrl, text="Split Ratio:").pack(side="left", padx=(0, 10))
+        self.split_mode = ttk.Combobox(split_ctrl, values=["Train/Val (80/20)", "Train/Val (70/30)", "Train/Val/Test (70/20/10)"], state="readonly", width=25)
+        self.split_mode.current(1)
+        self.split_mode.pack(side="left", padx=(0, 10))
+        
+        ttk.Button(split_ctrl, text="Split Dataset", command=self.split_dataset_logic).pack(side="left")
+        ttk.Label(ds_group, text="Splits images/labels into train/val/test folders and generates data.yaml for YOLO training.", foreground="gray").pack(anchor="w")
 
         # Stats
         stat_group = ttk.LabelFrame(self.tab_tools, text="Dataset Statistics", padding=20)
@@ -505,10 +511,8 @@ class App(tk.Tk):
             if not messagebox.askyesno("Warning", "Dataset seems to be already split (train/val folders exist).\nRe-splitting will move files again. Continue?"):
                 return
 
-        # Create train/val structure
-        for split in ["train", "val"]:
-            os.makedirs(os.path.join(root, split, "images"), exist_ok=True)
-            os.makedirs(os.path.join(root, split, "labels"), exist_ok=True)
+        mode = getattr(self, 'split_mode', None)
+        mode_str = mode.get() if mode else "70/30"
 
         all_images = [f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
         if not all_images:
@@ -516,20 +520,44 @@ class App(tk.Tk):
             return
 
         random.shuffle(all_images)
-        split_idx = int(len(all_images) * 0.7)
-        train_imgs = all_images[:split_idx]
-        val_imgs = all_images[split_idx:]
+        n = len(all_images)
+
+        splits_to_create = ["train", "val"]
+        if "70/20/10" in mode_str:
+            splits_to_create.append("test")
+            train_idx = int(n * 0.7)
+            val_idx = int(n * 0.9)
+            split_dict = {
+                "train": all_images[:train_idx],
+                "val": all_images[train_idx:val_idx],
+                "test": all_images[val_idx:]
+            }
+        elif "80/20" in mode_str:
+            train_idx = int(n * 0.8)
+            split_dict = {
+                "train": all_images[:train_idx],
+                "val": all_images[train_idx:]
+            }
+        else: # 70/30 default
+            train_idx = int(n * 0.7)
+            split_dict = {
+                "train": all_images[:train_idx],
+                "val": all_images[train_idx:]
+            }
+
+        # Create split folders
+        for split in splits_to_create:
+            os.makedirs(os.path.join(root, split, "images"), exist_ok=True)
+            os.makedirs(os.path.join(root, split, "labels"), exist_ok=True)
 
         def move_files(file_list, split_name):
             moved_count = 0
             for img_name in file_list:
                 try:
-                    # Move image
                     src_img = os.path.join(images_dir, img_name)
                     dst_img = os.path.join(root, split_name, "images", img_name)
                     shutil.move(src_img, dst_img)
                     
-                    # Move corresponding label
                     label_name = os.path.splitext(img_name)[0] + ".txt"
                     src_label = os.path.join(labels_dir, label_name)
                     dst_label = os.path.join(root, split_name, "labels", label_name)
@@ -540,8 +568,9 @@ class App(tk.Tk):
                     print(f"Error moving {img_name}: {e}")
             return moved_count
 
-        t_count = move_files(train_imgs, "train")
-        v_count = move_files(val_imgs, "val")
+        summary_counts = {}
+        for s_name, s_imgs in split_dict.items():
+            summary_counts[s_name] = move_files(s_imgs, s_name)
 
         # Create data.yaml
         yaml_path = os.path.join(root, "data.yaml")
@@ -549,28 +578,36 @@ class App(tk.Tk):
             "path": root,
             "train": "train/images",
             "val": "val/images",
-            "names": {0: "object"} # Placeholder, ideally scan classes
         }
+        if "test" in split_dict:
+            data["test"] = "test/images"
         
         # Scan for classes
         classes = set()
-        for split in ["train", "val"]:
+        for split in splits_to_create:
             lbl_path = os.path.join(root, split, "labels")
             if os.path.exists(lbl_path):
                 for f in os.listdir(lbl_path):
                     if f.endswith(".txt"):
-                        with open(os.path.join(lbl_path, f), "r") as lf:
-                            for line in lf:
-                                try:
-                                    classes.add(int(line.split()[0]))
-                                except: pass
-        if classes:
-            data["names"] = {c: f"class_{c}" for c in sorted(classes)}
+                        try:
+                            with open(os.path.join(lbl_path, f), "r") as lf:
+                                for line in lf:
+                                    parts = line.strip().split()
+                                    if parts:
+                                        classes.add(int(float(parts[0])))
+                        except Exception:
+                            pass
+
+        max_c = max(classes) if classes else 0
+        names = {i: f"class_{i}" for i in range(max_c + 1)}
+        data["nc"] = len(names)
+        data["names"] = names
 
         with open(yaml_path, "w") as f:
-            yaml.dump(data, f)
+            yaml.dump(data, f, default_flow_style=False)
 
-        messagebox.showinfo("Success", f"Split complete!\nTrain: {len(train_imgs)}\nVal: {len(val_imgs)}\ndata.yaml created.")
+        summary_str = "\n".join([f"{k.capitalize()}: {v}" for k, v in summary_counts.items()])
+        messagebox.showinfo("Success", f"Split complete!\n{summary_str}\n\ndata.yaml created at:\n{yaml_path}")
 
     def refresh_stats_logic(self):
         root = self.output_path.get()
@@ -671,9 +708,11 @@ class App(tk.Tk):
                 self.models_listbox.delete(0, "end")
                 self.model_paths = {}
                 for full_path in config.get("models", []):
-                    filename = os.path.basename(full_path)
-                    self.models_listbox.insert("end", filename)
-                    self.model_paths[filename] = full_path
+                    if full_path and full_path.strip():
+                        filename = os.path.basename(full_path)
+                        self.models_listbox.insert("end", filename)
+                        self.model_paths[filename] = full_path
+
                 self.output_path.set(config.get("output_path", ""))
                 self.conf_threshold.set(config.get("conf_threshold", 0.5))
                 self.iou_threshold.set(config.get("iou_threshold", 0.45))
@@ -688,13 +727,6 @@ class App(tk.Tk):
                 self.save_empty.set(config.get("save_empty", False))
                 self.save_annotated.set(config.get("save_annotated", True))
                 
-                # TPS
-                self.tps_enabled.set(config.get("tps_enabled", False))
-                self.tps_side = config.get("tps_side", "left")
-                self.tps_hotkey = config.get("tps_hotkey", "t")
-                if hasattr(self, 'tps_status_label'):
-                    self.tps_status_label.config(text=f"Side: {self.tps_side.upper()} (Hotkey: {self.tps_hotkey.upper()})")
-
                 self.train_model.set(config.get("train_model", "yolov8n.pt"))
                 self.train_epochs.set(config.get("train_epochs", 50))
                 self.train_batch.set(config.get("train_batch", 16))
@@ -726,10 +758,6 @@ class App(tk.Tk):
         # Comboboxes
         self.yt_res.bind("<<ComboboxSelected>>", lambda e: self.save_config(silent=True))
         self.out_res.bind("<<ComboboxSelected>>", lambda e: self.save_config(silent=True))
-        # self.train_device is a Var, but let's bind the combo too if it has a ref, 
-        # actually train_device var trace covers it.
-        
-        # Note: Listbox and Tab changes are handled in their respective methods/bindings.
 
     class TextRedirector:
         """Redirects print() output to a Tkinter Text widget in real time."""
@@ -737,9 +765,11 @@ class App(tk.Tk):
             self.text_widget = text_widget
 
         def write(self, message):
-            self.text_widget.insert("end", message)
-            self.text_widget.see("end")
-            self.text_widget.update_idletasks()
+            try:
+                self.text_widget.insert("end", message)
+                self.text_widget.see("end")
+            except Exception:
+                pass
 
         def flush(self):
             pass
@@ -938,32 +968,54 @@ class App(tk.Tk):
         threading.Thread(target=self.training_worker, args=(yaml_path, weights, epochs, imgsz, batch, device), daemon=True).start()
 
     def training_worker(self, yaml_path, weights, epochs, imgsz, batch, device):
-        # Redirect stdout/stderr if they are None (common in frozen apps)
         import sys
-        if sys.stdout is None:
-            sys.stdout = self.TextRedirector(self.log_text)
-        if sys.stderr is None:
-            sys.stderr = self.TextRedirector(self.log_text)
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = self.TextRedirector(self.log_text)
 
         self.update_status("🟡 Training...", "#FFD966")
         try:
             from ultralytics import YOLO
-        except Exception as e:
-            messagebox.showerror("Missing Dependency", "Install ultralytics and torch to train:\n\npip install ultralytics\npip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu")
+        except Exception:
+            messagebox.showerror(
+                "Missing Dependency",
+                "Install ultralytics and torch to train:\n\npip install ultralytics torch torchvision"
+            )
             self.update_status("🔴 Error", "#FF7F7F")
+            sys.stdout, sys.stderr = old_stdout, old_stderr
             return
+
         try:
+            print(f"\n[INFO] Initializing YOLO with weights: {weights}")
+            print(f"[INFO] Dataset config: {yaml_path}")
+            print(f"[INFO] Epochs: {epochs}, Batch size: {batch}, Image size: {imgsz}, Device: {device}\n")
+            
             model = YOLO(weights)
             dev = None if device == "auto" else device
             model.train(data=yaml_path, epochs=int(epochs), imgsz=int(imgsz), batch=int(batch), device=dev)
             
-            self.update_status("� Exporting ONNX...", "#FFD966")
-            model.export(format="onnx")
+            self.update_status("📦 Exporting ONNX...", "#FFD966")
+            print("\n[INFO] Exporting trained model to ONNX...")
+            exported = model.export(format="onnx")
 
-            self.update_status("�🟢 Trained & Exported", "#9FEF9F")
+            self.update_status("🟢 Trained & Exported", "#9FEF9F")
+            exported_path = str(exported) if exported else None
+            print(f"\n[SUCCESS] Training and export complete! ONNX model: {exported_path}\n")
+
+            if exported_path and os.path.exists(exported_path):
+                fn = os.path.basename(exported_path)
+                existing = list(self.models_listbox.get(0, "end"))
+                if fn not in existing:
+                    if messagebox.askyesno("Training Succeeded", f"Model successfully exported to:\n{exported_path}\n\nAdd this new model to your detection models list?"):
+                        self.models_listbox.insert("end", fn)
+                        self.model_paths[fn] = exported_path
+                        self.save_config(silent=True)
         except Exception as e:
+            import traceback
+            print(f"\n[ERROR] Training failed: {e}\n{traceback.format_exc()}")
             messagebox.showerror("Training Failed", str(e))
             self.update_status("🔴 Error", "#FF7F7F")
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
 
 if __name__ == "__main__":
     app = App()

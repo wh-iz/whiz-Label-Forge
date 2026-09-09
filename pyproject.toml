@@ -3,36 +3,33 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "prolabeler"
-version = "1.0.0"
-description = "An advanced labeling tool with ONNX detection, YouTube import, and GPU support."
+name = "whiz-label-forge"
+version = "1.2.0"
+description = "AI dataset preparation, multi-model YOLO auto-labeling, and training toolkit."
 readme = "README.md"
 requires-python = ">=3.9"
 
 dependencies = [
-    "flatbuffers>=2.0",
     "numpy>=1.23.5,<2",
-    "Pillow>=10.1.0",
-    "protobuf>=3.20.3",
-    "keyboard>=0.13.5",
-    "scipy>=1.13.1",
-    "rich>=13.7.1",
-    "loguru>=0.7.2",
-    "PyYAML>=6.0.1",
-    "pybind11>=2.12",
-    "requests>=2.25.1",
-    "PyQt6>=6.7.1",
-    "av",
-    "tqdm",
-    "opencv-python==4.10.0.84",
+    "Pillow>=10.0.0",
+    "scipy>=1.10.0",
+    "PyYAML>=6.0.0",
+    "opencv-python>=4.8.0",
     "yt-dlp>=2024.10.22",
     "sv-ttk>=2.6.0",
+    "onnxruntime>=1.18.0",
+    "tqdm>=4.65.0",
 ]
 
 [project.optional-dependencies]
-cpu = [
-    "onnxruntime>=1.18.0",
-]
 gpu = [
     "onnxruntime-gpu>=1.18.0",
 ]
+training = [
+    "ultralytics>=8.0.0",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+]
+
+[tool.setuptools]
+py-modules = ["App", "LabelEditor", "Main", "NullGeneratorTab"]

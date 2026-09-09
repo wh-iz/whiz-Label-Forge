@@ -7,9 +7,11 @@ block_cipher = None
 
 datas = [
     (os.path.dirname(sv_ttk.__file__), 'sv_ttk'),
-    ('config.json', '.'),
-    ('ffmpeg.exe', '.')
 ]
+if os.path.exists('config.json'):
+    datas.append(('config.json', '.'))
+if os.path.exists('ffmpeg.exe'):
+    datas.append(('ffmpeg.exe', '.'))
 binaries = []
 hiddenimports = [
     'Main',

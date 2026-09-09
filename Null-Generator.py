@@ -174,7 +174,7 @@ tk.Scale(root, from_=0.01, to=1.0, resolution=0.01, variable=expansion_scale, or
 # Inpainting radius slider
 tk.Label(root, text="Inpainting Radius:", bg=bg_color, fg=fg_color).grid(row=5, column=0, padx=10, pady=5)
 radius_scale = tk.IntVar(value=5)
-tk.Scale(root, from_=0.01, to=1.0, variable=radius_scale, orient=tk.HORIZONTAL, length=300, bg=bg_color, fg=fg_color, troughcolor=listbox_bg, highlightbackground=bg_color).grid(row=5, column=1, padx=10, pady=5)
+tk.Scale(root, from_=1, to=25, resolution=1, variable=radius_scale, orient=tk.HORIZONTAL, length=300, bg=bg_color, fg=fg_color, troughcolor=listbox_bg, highlightbackground=bg_color).grid(row=5, column=1, padx=10, pady=5)
 
 # Soft mask checkbox
 soft_mask_var = tk.BooleanVar(value=False)

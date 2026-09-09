@@ -3,7 +3,6 @@
     "youtube_link": "",
     "yt_res": "2160p",
     "models": [
-        "",
         "C:/Users/whiz/Downloads/ARC_Raiders_25k.onnx"
     ],
     "output_path": "C:/Users/whiz/Desktop/ProLabeler-1.1/OUTPUT",

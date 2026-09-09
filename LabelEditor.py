@@ -12,6 +12,8 @@ class LabelEditor(ttk.Frame):
         
         self.current_image_path = None
         self.current_label_path = None
+        self.current_images_dir = ""
+        self.current_labels_dir = ""
         self.image_list = []
         self.current_index = -1
         
@@ -59,10 +61,10 @@ class LabelEditor(ttk.Frame):
         self.paned.pack(fill="both", expand=True)
         
         # --- Left Sidebar ---
-        self.sidebar = ttk.Frame(self.paned, width=200)
+        self.sidebar = ttk.Frame(self.paned, width=220)
         self.paned.add(self.sidebar, weight=0)
         
-        ttk.Label(self.sidebar, text="Images").pack(pady=5)
+        ttk.Label(self.sidebar, text="Dataset Images").pack(pady=5)
         
         # Treeview with Scrollbar
         self.sidebar_frame = ttk.Frame(self.sidebar)
@@ -94,14 +96,20 @@ class LabelEditor(ttk.Frame):
         self.toolbar = ttk.Frame(self.right_frame)
         self.toolbar.pack(fill="x", padx=5, pady=5)
         
+        ttk.Label(self.toolbar, text="Split:").pack(side="left")
+        self.split_var = tk.StringVar(value="auto")
+        self.split_combo = ttk.Combobox(self.toolbar, textvariable=self.split_var, values=["auto", "root", "train", "val", "test"], width=8, state="readonly")
+        self.split_combo.pack(side="left", padx=(3, 10))
+        self.split_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_file_list())
+
         ttk.Label(self.toolbar, text="Class ID:").pack(side="left")
         self.class_var = tk.StringVar(value="0")
-        self.class_entry = ttk.Entry(self.toolbar, textvariable=self.class_var, width=10)
+        self.class_entry = ttk.Entry(self.toolbar, textvariable=self.class_var, width=8)
         self.class_entry.pack(side="left", padx=5)
         self.class_entry.bind("<Return>", self.update_selected_class)
         self.class_entry.bind("<FocusOut>", self.update_selected_class)
         
-        ttk.Button(self.toolbar, text="Save (Ctrl+S)", command=self.save_labels).pack(side="left", padx=10)
+        ttk.Button(self.toolbar, text="Save (Ctrl+S)", command=self.save_labels).pack(side="left", padx=5)
         ttk.Button(self.toolbar, text="Delete Box (Del)", command=self.delete_selected).pack(side="left", padx=5)
         ttk.Button(self.toolbar, text="Delete Image", command=self.delete_selected_images).pack(side="left", padx=5)
         ttk.Button(self.toolbar, text="Refresh", command=self.refresh_file_list).pack(side="left", padx=5)
@@ -139,6 +147,10 @@ class LabelEditor(ttk.Frame):
         self.canvas.bind("<Control-y>", lambda e: self.redo())
         self.canvas.bind("<Left>", lambda e: self.prev_image())
         self.canvas.bind("<Right>", lambda e: self.next_image())
+        self.canvas.bind("<a>", lambda e: self.prev_image())
+        self.canvas.bind("<A>", lambda e: self.prev_image())
+        self.canvas.bind("<d>", lambda e: self.next_image())
+        self.canvas.bind("<D>", lambda e: self.next_image())
         
         # Focus canvas on enter
         self.canvas.bind("<Enter>", lambda e: self.canvas.focus_set())
@@ -156,6 +168,28 @@ class LabelEditor(ttk.Frame):
         except Exception:
             return None
 
+    def _load_thumbnails_async(self):
+        import threading
+        images_dir = self.current_images_dir
+        items_to_load = list(self.image_list[:100])
+
+        def worker():
+            for i, f in enumerate(items_to_load):
+                full_path = os.path.join(images_dir, f)
+                if full_path not in self.thumbnail_cache:
+                    thumb = self.get_thumbnail(full_path)
+                    if thumb:
+                        self.after(0, lambda iid=str(i), t=thumb: self._set_tree_thumb(iid, t))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_tree_thumb(self, iid, thumb):
+        try:
+            if self.file_tree.exists(iid):
+                self.file_tree.item(iid, image=thumb)
+        except Exception:
+            pass
+
     def refresh_file_list(self):
         if not self.app: return
         
@@ -163,36 +197,59 @@ class LabelEditor(ttk.Frame):
         if not output_path or not os.path.exists(output_path):
             self.lbl_status.config(text="Output path invalid")
             return
-            
-        img_dir = os.path.join(output_path, "images")
+
+        choice = self.split_var.get()
+        if choice == "auto":
+            root_img = os.path.join(output_path, "images")
+            train_img = os.path.join(output_path, "train", "images")
+            if os.path.exists(root_img) and [f for f in os.listdir(root_img) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]:
+                img_dir = root_img
+                lbl_dir = os.path.join(output_path, "labels")
+            elif os.path.exists(train_img):
+                img_dir = train_img
+                lbl_dir = os.path.join(output_path, "train", "labels")
+            else:
+                img_dir = root_img
+                lbl_dir = os.path.join(output_path, "labels")
+        elif choice == "root":
+            img_dir = os.path.join(output_path, "images")
+            lbl_dir = os.path.join(output_path, "labels")
+        else:
+            img_dir = os.path.join(output_path, choice, "images")
+            lbl_dir = os.path.join(output_path, choice, "labels")
+
+        self.current_images_dir = img_dir
+        self.current_labels_dir = lbl_dir
+
         if not os.path.exists(img_dir):
-            self.lbl_status.config(text="No 'images' folder found")
+            self.lbl_status.config(text=f"No folder: {os.path.basename(img_dir)}")
+            self.image_list = []
+            for item in self.file_tree.get_children():
+                self.file_tree.delete(item)
             return
-            
+
         self.image_list = sorted([f for f in os.listdir(img_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
         
         # Clear Treeview
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
             
-        # Populate Treeview
+        # Populate Treeview instantly without blocking
         for i, f in enumerate(self.image_list):
             full_path = os.path.join(img_dir, f)
-            thumb = self.get_thumbnail(full_path)
-            # Use i as iid to easily map back to index
+            thumb = self.thumbnail_cache.get(full_path)
             if thumb:
                 self.file_tree.insert("", "end", iid=str(i), text="", image=thumb, values=(f,))
             else:
                 self.file_tree.insert("", "end", iid=str(i), text="", values=(f,))
             
         self.lbl_status.config(text=f"Found {len(self.image_list)} images")
+        self._load_thumbnails_async()
 
     def on_file_select(self, event):
         sel = self.file_tree.selection()
         if not sel: return
         
-        # In extended mode, user can select multiple. 
-        # For preview, we just load the first one selected.
         try:
             idx = int(sel[0])
             self.load_image_by_index(idx)
@@ -201,10 +258,13 @@ class LabelEditor(ttk.Frame):
 
     def update_selected_class(self, event=None):
         if self.selected_box_index != -1 and 0 <= self.selected_box_index < len(self.labels):
-            new_cls = self.class_var.get()
-            # Update the class of the selected box
-            self.labels[self.selected_box_index][0] = new_cls
-            self.draw_boxes()
+            new_cls = self.class_var.get().strip()
+            if not new_cls:
+                new_cls = "0"
+            if str(self.labels[self.selected_box_index][0]) != new_cls:
+                self.save_state()
+                self.labels[self.selected_box_index][0] = new_cls
+                self.draw_boxes()
 
     def load_image_by_index(self, index):
         if index < 0 or index >= len(self.image_list): return
@@ -215,13 +275,10 @@ class LabelEditor(ttk.Frame):
 
         self.current_index = index
         filename = self.image_list[index]
-        output_path = self.app.output_path.get()
         
-        self.current_image_path = os.path.join(output_path, "images", filename)
-        
-        # Load Labels
+        self.current_image_path = os.path.join(self.current_images_dir, filename)
         label_name = os.path.splitext(filename)[0] + ".txt"
-        self.current_label_path = os.path.join(output_path, "labels", label_name)
+        self.current_label_path = os.path.join(self.current_labels_dir, label_name)
         
         # Reset View
         self.zoom_level = 1.0
@@ -486,7 +543,9 @@ class LabelEditor(ttk.Frame):
             coords = self.get_box_pixel_coords(i)
             if not coords: continue
             x1, y1, x2, y2 = coords
-            if x1 <= x <= x2 and y1 <= y <= y2:
+            min_x, max_x = min(x1, x2), max(x1, x2)
+            min_y, max_y = min(y1, y2), max(y1, y2)
+            if min_x <= x <= max_x and min_y <= y <= max_y:
                 clicked_box = i
                 break
         
@@ -615,7 +674,8 @@ class LabelEditor(ttk.Frame):
             self.load_image_by_index(next_idx)
 
     def delete_selected(self):
-        if self.selected_box_index != -1:
+        if self.selected_box_index != -1 and 0 <= self.selected_box_index < len(self.labels):
+            self.save_state()
             del self.labels[self.selected_box_index]
             self.selected_box_index = -1
             self.draw_boxes()
@@ -624,14 +684,12 @@ class LabelEditor(ttk.Frame):
         sel = self.file_tree.selection()
         if not sel: return
 
-        if not messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete {len(sel)} images?"):
+        if not messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete {len(sel)} image(s)?"):
             return
 
-        output_path = self.app.output_path.get()
+        output_path = self.app.output_path.get() if self.app else ""
         deleted_count = 0
         
-        # Get filenames first because indices change if we pop from list
-        # But we will rebuild list anyway
         files_to_delete = []
         for iid in sel:
             try:
@@ -643,13 +701,14 @@ class LabelEditor(ttk.Frame):
 
         for fname in files_to_delete:
             try:
-                img_path = os.path.join(output_path, "images", fname)
-                lbl_path = os.path.join(output_path, "labels", os.path.splitext(fname)[0] + ".txt")
+                img_path = os.path.join(self.current_images_dir, fname)
+                lbl_path = os.path.join(self.current_labels_dir, os.path.splitext(fname)[0] + ".txt")
+                ann_path = os.path.join(output_path, "annotated", fname) if output_path else ""
                 
                 if os.path.exists(img_path): os.remove(img_path)
                 if os.path.exists(lbl_path): os.remove(lbl_path)
+                if ann_path and os.path.exists(ann_path): os.remove(ann_path)
                 
-                # Remove from cache
                 if img_path in self.thumbnail_cache:
                     del self.thumbnail_cache[img_path]
                     
@@ -666,7 +725,7 @@ class LabelEditor(ttk.Frame):
         self.labels = []
         self.raw_image = None
         self.canvas.delete("all")
-        self.lbl_status.config(text=f"Deleted {deleted_count} images")
+        self.lbl_status.config(text=f"Deleted {deleted_count} image(s)")
 
     def on_right_click(self, event):
         self.on_mouse_down(event)

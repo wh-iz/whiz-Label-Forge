@@ -24,25 +24,33 @@ def download_youtube_video(url: str, target_res: str = "1080p", progress_callbac
         
     ffmpeg_path = os.path.join(base_path, "ffmpeg.exe")
     if not os.path.exists(ffmpeg_path):
-        # Fallback to current directory if not found in MEIPASS (e.g. if not bundled but expected next to exe)
         ffmpeg_path = os.path.join(os.getcwd(), "ffmpeg.exe")
+    if not os.path.exists(ffmpeg_path):
+        system_ffmpeg = shutil.which("ffmpeg")
+        if system_ffmpeg:
+            ffmpeg_path = system_ffmpeg
 
     output_template = os.path.join(temp_dir, 'yt_video_%(id)s_%(height)sp.%(ext)s')
 
     def hook(d):
         if d['status'] == 'downloading':
-            percent = d.get('_percent_str', '').strip()
+            percent_str = d.get('_percent_str', '').strip()
             speed = d.get('_speed_str', '').strip()
             eta = d.get('eta', '?')
-            text = f"Downloading {percent} at {speed} (ETA: {eta}s)"
+            text = f"Downloading {percent_str} at {speed} (ETA: {eta}s)"
+            numeric_percent = None
+            total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            downloaded = d.get('downloaded_bytes', 0)
+            if total and total > 0:
+                numeric_percent = min(100.0, (downloaded / total) * 100.0)
             if progress_callback:
-                progress_callback(text)
+                progress_callback(text, numeric_percent)
         elif d['status'] == 'finished':
             if progress_callback:
-                progress_callback("Download complete, finalizing file...")
+                progress_callback("Download complete, finalizing file...", 100.0)
 
     ydl_opts = {
-        'format': f'bestvideo[height<={res_int}]+bestaudio/best',
+        'format': f'bestvideo[height<={res_int}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={res_int}]+bestaudio/best[height<={res_int}]/best',
         "ffmpeg_location": ffmpeg_path if os.path.exists(ffmpeg_path) else None,
         'merge_output_format': 'mp4',
         'outtmpl': output_template,
@@ -142,43 +150,96 @@ def preprocess_frame(frame, target_size=640):
     return inp, scale, (dx, dy)
 
 # ------------------------------
-# Postprocess (multi-class)
+# Postprocess (multi-class & architecture-aware + NMS)
 # ------------------------------
-def postprocess_predictions(preds, conf_thresh=0.25):
-    boxes = []
+def postprocess_predictions(preds, conf_thresh=0.25, iou_thresh=0.45):
     out = np.array(preds[0])
-    print(f"  Raw output shape: {out.shape}")
     if out.ndim == 3:
         out = out[0]
-    if out.ndim == 2:
-        a, b = out.shape
-        if 5 <= a <= 512 and b > a:
-            obs = out.T
-        else:
-            obs = out
-    else:
-        obs = out.reshape(-1, out.shape[-1])
-    num_attrs = obs.shape[1]
-    print(f"  Parsed boxes shape: {obs.shape}")
-    if num_attrs == 5:
-        for p in obs:
+    if out.ndim != 2:
+        out = out.reshape(-1, out.shape[-1])
+
+    num_rows, num_cols = out.shape
+
+    # Check for End-to-End format (e.g. YOLOv10: shape (300, 6) with [x1, y1, x2, y2, score, class_id])
+    if num_cols == 6 and num_rows <= 1000:
+        boxes = []
+        for p in out:
             conf = float(p[4])
             if conf >= conf_thresh:
-                cx, cy, w, h = p[0], p[1], p[2], p[3]
-                boxes.append([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, conf, 0])
-    elif num_attrs > 5:
+                x1, y1, x2, y2 = float(p[0]), float(p[1]), float(p[2]), float(p[3])
+                cls_id = int(p[5])
+                boxes.append([x1, y1, x2, y2, conf, cls_id])
+        return boxes
+
+    # Transpose channels-first output (YOLOv8/v9/11: shape (4+C, N) where N > 4+C)
+    if num_rows <= 512 and num_cols > num_rows:
+        obs = out.T
+        is_yolov8_style = True
+    else:
+        obs = out
+        is_yolov8_style = False
+
+    num_attrs = obs.shape[1]
+    if num_attrs < 5:
+        return []
+
+    cx = obs[:, 0]
+    cy = obs[:, 1]
+    w = obs[:, 2]
+    h = obs[:, 3]
+
+    if num_attrs == 5:
+        # 1 class, single score (no separate objectness)
+        scores = obs[:, 4]
+        cls_ids = np.zeros(len(scores), dtype=int)
+    elif is_yolov8_style:
+        # YOLOv8 / YOLOv9 / YOLO11: columns 4: are class probabilities directly
+        cls_scores = obs[:, 4:]
+        cls_ids = np.argmax(cls_scores, axis=1)
+        scores = cls_scores[np.arange(len(cls_scores)), cls_ids]
+    else:
+        # YOLOv5 / YOLOv7: column 4 is objectness, columns 5: are class scores
         obj = obs[:, 4]
         cls_scores = obs[:, 5:]
-        cls_idx = np.argmax(cls_scores, axis=1)
-        cls_prob = cls_scores[np.arange(cls_scores.shape[0]), cls_idx]
-        confs = obj * cls_prob
-        for i in range(obs.shape[0]):
-            conf = float(confs[i])
-            if conf >= conf_thresh:
-                p = obs[i]
-                cx, cy, w, h = p[0], p[1], p[2], p[3]
-                boxes.append([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, conf, int(cls_idx[i])])
-    return boxes
+        cls_ids = np.argmax(cls_scores, axis=1)
+        scores = obj * cls_scores[np.arange(len(cls_scores)), cls_ids]
+
+    mask = scores >= conf_thresh
+    if not np.any(mask):
+        return []
+
+    cx = cx[mask]
+    cy = cy[mask]
+    w = w[mask]
+    h = h[mask]
+    scores = scores[mask]
+    cls_ids = cls_ids[mask]
+
+    x1 = cx - w / 2.0
+    y1 = cy - h / 2.0
+    x2 = cx + w / 2.0
+    y2 = cy + h / 2.0
+
+    # Apply class-aware NMS using cv2.dnn.NMSBoxes
+    cv_boxes = [[float(x1[i]), float(y1[i]), float(w[i]), float(h[i])] for i in range(len(scores))]
+    confidences = [float(s) for s in scores]
+
+    unique_classes = np.unique(cls_ids)
+    final_boxes = []
+
+    for c in unique_classes:
+        c_indices = np.where(cls_ids == c)[0]
+        c_cv_boxes = [cv_boxes[i] for i in c_indices]
+        c_scores = [confidences[i] for i in c_indices]
+
+        keep = cv2.dnn.NMSBoxes(c_cv_boxes, c_scores, score_threshold=conf_thresh, nms_threshold=iou_thresh)
+        if len(keep) > 0:
+            for k in np.array(keep).flatten():
+                idx = c_indices[k]
+                final_boxes.append([float(x1[idx]), float(y1[idx]), float(x2[idx]), float(y2[idx]), float(scores[idx]), int(c)])
+
+    return final_boxes
 
 # ------------------------------
 # Rescale boxes back to original frame
@@ -190,10 +251,10 @@ def rescale_boxes(boxes, scale, offset, orig_w, orig_h):
         b[1] = (b[1] - dy) / scale
         b[2] = (b[2] - dx) / scale
         b[3] = (b[3] - dy) / scale
-        b[0] = max(0, min(b[0], orig_w))
-        b[1] = max(0, min(b[1], orig_h))
-        b[2] = max(0, min(b[2], orig_w))
-        b[3] = max(0, min(b[3], orig_h))
+        b[0] = max(0.0, min(float(b[0]), float(orig_w)))
+        b[1] = max(0.0, min(float(b[1]), float(orig_h)))
+        b[2] = max(0.0, min(float(b[2]), float(orig_w)))
+        b[3] = max(0.0, min(float(b[3]), float(orig_h)))
     return boxes
 
 # ------------------------------
@@ -204,7 +265,6 @@ def resize_and_adjust_boxes(frame, boxes, new_size):
     orig_h, orig_w = frame.shape[:2]
     
     # Direct Center Crop (Pixel-perfect, no scaling)
-    # Calculate center crop coordinates
     center_x, center_y = orig_w // 2, orig_h // 2
     half_w, half_h = target_w // 2, target_h // 2
     
@@ -213,91 +273,110 @@ def resize_and_adjust_boxes(frame, boxes, new_size):
     x2 = min(orig_w, center_x + half_w)
     y2 = min(orig_h, center_y + half_h)
     
-    # Crop
     resized = frame[y1:y2, x1:x2]
+    act_h, act_w = resized.shape[:2]
     
-    # Adjust boxes
     new_boxes = []
     for b in boxes:
         bx1, by1, bx2, by2, conf, cls = b
-        # Shift coordinates
         bx1 -= x1
         bx2 -= x1
         by1 -= y1
         by2 -= y1
         
-        # Clip to new boundaries
-        bx1 = max(0, min(bx1, target_w))
-        bx2 = max(0, min(bx2, target_w))
-        by1 = max(0, min(by1, target_h))
-        by2 = max(0, min(by2, target_h))
+        bx1 = max(0.0, min(bx1, float(act_w)))
+        bx2 = max(0.0, min(bx2, float(act_w)))
+        by1 = max(0.0, min(by1, float(act_h)))
+        by2 = max(0.0, min(by2, float(act_h)))
         
-        # Keep box if valid
         if bx2 > bx1 and by2 > by1:
             new_boxes.append([bx1, by1, bx2, by2, conf, cls])
             
     return resized, new_boxes
 
 # ------------------------------
-# IoU + box merging
+# IoU + Weighted Box Fusion (Ensemble merging)
 # ------------------------------
 def iou(box1, box2):
     x1 = max(box1[0], box2[0])
     y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2])
     y2 = min(box1[3], box2[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    return inter / (area1 + area2 - inter + 1e-6)
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area1 = max(0.0, box1[2] - box1[0]) * max(0.0, box1[3] - box1[1])
+    area2 = max(0.0, box2[2] - box2[0]) * max(0.0, box2[3] - box2[1])
+    union = area1 + area2 - inter
+    return inter / union if union > 0 else 0.0
 
 def merge_boxes(boxes, merge_iou=0.5):
+    if not boxes:
+        return []
+    # Sort boxes descending by confidence
+    sorted_boxes = sorted(boxes, key=lambda b: b[4], reverse=True)
     merged, used = [], set()
-    for i, box in enumerate(boxes):
-        if i in used: continue
+
+    for i, box in enumerate(sorted_boxes):
+        if i in used:
+            continue
         x1, y1, x2, y2, conf, cls = box
-        for j in range(i + 1, len(boxes)):
-            if j in used: continue
-            other = boxes[j]
-            if cls != other[5]: continue
+        total_w = conf
+        sum_x1 = x1 * conf
+        sum_y1 = y1 * conf
+        sum_x2 = x2 * conf
+        sum_y2 = y2 * conf
+        max_conf = conf
+
+        for j in range(i + 1, len(sorted_boxes)):
+            if j in used:
+                continue
+            other = sorted_boxes[j]
+            if cls != other[5]:
+                continue
             if iou(box[:4], other[:4]) > merge_iou:
-                x1, y1 = min(x1, other[0]), min(y1, other[1])
-                x2, y2 = max(x2, other[2]), max(y2, other[3])
-                conf = max(conf, other[4])
+                w = other[4]
+                sum_x1 += other[0] * w
+                sum_y1 += other[1] * w
+                sum_x2 += other[2] * w
+                sum_y2 += other[3] * w
+                total_w += w
+                max_conf = max(max_conf, other[4])
                 used.add(j)
-        merged.append([x1, y1, x2, y2, conf, cls])
+
+        avg_x1 = sum_x1 / total_w
+        avg_y1 = sum_y1 / total_w
+        avg_x2 = sum_x2 / total_w
+        avg_y2 = sum_y2 / total_w
+        merged.append([avg_x1, avg_y1, avg_x2, avg_y2, max_conf, cls])
     return merged
 
 # ------------------------------
 # Perceptual Hash for duplicate detection
 # ------------------------------
 def compute_phash(frame, hash_size=8):
-    """Compute perceptual hash of a frame"""
-    # Convert to grayscale and resize to hash_size+1 to allow for DCT
+    """Compute perceptual difference hash (dHash) of a frame"""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(gray, (hash_size + 1, hash_size))
-    
-    # Compute horizontal gradient (simple difference hash)
+    resized = cv2.resize(gray, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
     diff = resized[:, 1:] > resized[:, :-1]
-    
-    # Convert to integer hash
-    return sum([2 ** i for (i, v) in enumerate(diff.flatten()) if v])
+    val = 0
+    for v in diff.flatten():
+        val = (val << 1) | int(v)
+    return val
 
 def hamming_distance(hash1, hash2):
-    """Calculate Hamming distance between two hashes"""
-    return bin(hash1 ^ hash2).count('1')
+    """Calculate Hamming distance between two 64-bit perceptual hashes"""
+    return (hash1 ^ hash2).bit_count()
 
 def is_similar_to_recent(frame, recent_hashes, similarity_threshold=5):
     """
     Check if frame is similar to any recent frame.
     similarity_threshold: lower = stricter (0 = identical, 64 = completely different)
     """
+    if not recent_hashes or similarity_threshold <= 0:
+        return False
     current_hash = compute_phash(frame)
-    
     for prev_hash in recent_hashes:
         if hamming_distance(current_hash, prev_hash) <= similarity_threshold:
             return True
-    
     return False
 
 # ------------------------------
@@ -305,16 +384,22 @@ def is_similar_to_recent(frame, recent_hashes, similarity_threshold=5):
 # ------------------------------
 def save_labels(boxes, img_w, img_h, save_path):
     lines = []
-    for b in boxes:
-        x1, y1, x2, y2, conf, cls = [float(v) for v in b]
-        x_c = ((x1 + x2) / 2) / img_w
-        y_c = ((y1 + y2) / 2) / img_h
-        w = (x2 - x1) / img_w
-        h = (y2 - y1) / img_h
-        lines.append(f"{int(cls)} {x_c:.6f} {y_c:.6f} {w:.6f} {h:.6f}")
-    if lines:
-        with open(save_path, "w") as f:
-            f.write("\n".join(lines))
+    if img_w > 0 and img_h > 0:
+        for b in boxes:
+            x1, y1, x2, y2, conf, cls = [float(v) for v in b]
+            x_c = ((x1 + x2) / 2.0) / img_w
+            y_c = ((y1 + y2) / 2.0) / img_h
+            w = (x2 - x1) / img_w
+            h = (y2 - y1) / img_h
+            x_c = max(0.0, min(1.0, x_c))
+            y_c = max(0.0, min(1.0, y_c))
+            w = max(0.0, min(1.0, w))
+            h = max(0.0, min(1.0, h))
+            if w > 0 and h > 0:
+                lines.append(f"{int(cls)} {x_c:.6f} {y_c:.6f} {w:.6f} {h:.6f}")
+    with open(save_path, "w") as f:
+        if lines:
+            f.write("\n".join(lines) + "\n")
 
 def annotate_frame(frame, boxes):
     h, w = frame.shape[:2]
@@ -414,6 +499,8 @@ def main(args=None, progress_callback=None, detect_progress_callback=None, cance
 
         models = []
         for m in args.models:
+            if not m or not m.strip():
+                continue
             try:
                 models.append(load_model(m, force_cpu=args.cpu))
             except Exception as e:
@@ -464,7 +551,8 @@ def main(args=None, progress_callback=None, detect_progress_callback=None, cance
         
         # Initialize ThreadPoolExecutor once
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        executor = ThreadPoolExecutor(max_workers=len(models))
+        executor = ThreadPoolExecutor(max_workers=max(1, len(models)))
+        last_progress_time = 0.0
 
         try:
             while True:
@@ -512,11 +600,8 @@ def main(args=None, progress_callback=None, detect_progress_callback=None, cance
                         return []
                     try:
                         input_name = model.get_inputs()[0].name
-                        # print(f"Running {input_name}") # Reduced log noise
                         pred = model.run(None, {input_name: inp})
-                        boxes = postprocess_predictions(pred, conf_thresh=args.conf)
-                        if not boxes and args.conf > 0.3:
-                            boxes = postprocess_predictions(pred, conf_thresh=max(0.1, args.conf * 0.5))
+                        boxes = postprocess_predictions(pred, conf_thresh=args.conf, iou_thresh=args.iou)
                         boxes = rescale_boxes(boxes, scale, offset, img_w, img_h)
                         return boxes
                     except Exception as e:
@@ -540,7 +625,7 @@ def main(args=None, progress_callback=None, detect_progress_callback=None, cance
                 target_id = getattr(args, 'target_class_id', -1)
                 if target_id >= 0:
                     for b in final_boxes:
-                        b[5] = float(target_id)  # Override class ID
+                        b[5] = int(target_id)  # Override class ID
 
                 if final_boxes or getattr(args, 'save_empty', False):
                     # Check if this frame is similar to recent frames
@@ -557,7 +642,7 @@ def main(args=None, progress_callback=None, detect_progress_callback=None, cance
                         try:
                             w, h = map(int, args.out_res.lower().split("x"))
                             frame, final_boxes = resize_and_adjust_boxes(frame, final_boxes, (w, h))
-                            img_w, img_h = w, h
+                            img_h, img_w = frame.shape[:2]
                         except Exception:
                             print("Invalid out_res format, expected WIDTHxHEIGHT")
 
@@ -568,29 +653,28 @@ def main(args=None, progress_callback=None, detect_progress_callback=None, cance
                     img_path = os.path.join(args.out, "images", img_name)
                     label_name = f"{frame_idx:06d}.txt"
                     label_path = os.path.join(args.out, "labels", label_name)
+                    ann_path = os.path.join(args.out, "annotated", img_name)
+
                     save_labels(final_boxes, img_w, img_h, label_path)
                 
-                    ann_path = os.path.join(args.out, "annotated", img_name)
                     if getattr(args, 'save_annotated', True):
                         cv2.imwrite(ann_path, annotated)
                 
+                    if getattr(args, 'save_raw', True):
+                        cv2.imwrite(img_path, frame)
+
                     if save_callback:
                         save_callback(img_path, label_path, ann_path)
                     saved_count += 1
-                    if getattr(args, 'save_raw', True) and final_boxes:
-                        cv2.imwrite(img_path, frame)
-                    else:
-                        try:
-                            os.remove(img_path)
-                        except:
-                            pass
 
                 frame_idx += 1
 
-                # Update progress bar
-                percent = (frame_idx / total_frames) * 100
-                remaining = max(0, (total_frames - frame_idx) / fps)
-                if detect_progress_callback:
+                # Throttled progress bar update
+                now = time.time()
+                if detect_progress_callback and (now - last_progress_time >= 0.1 or frame_idx >= total_frames):
+                    last_progress_time = now
+                    percent = min(100.0, (frame_idx / total_frames) * 100.0)
+                    remaining = max(0.0, (total_frames - frame_idx) / fps)
                     detect_progress_callback(percent, eta=remaining)
 
             cap.release()
